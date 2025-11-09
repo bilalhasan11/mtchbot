@@ -5,12 +5,13 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
-
+from telegram.request import HTTPXRequest
+import threading
 import database as db
 
-TOKEN = "8568453320:AAEJdxuRaE6lqiq4b-Yx4q0XlZT0jqsT6ik"
+TOKEN = "8568453320:AAEJdxuRaE6lqiq4b-Yx4q0XlZT0jqsT6ik"  # Hardcoded as requested
 if not TOKEN:
-    raise ValueError("BOT_TOKEN not set in HF Secrets")
+    raise ValueError("BOT_TOKEN not set")
 
 # States
 AGE, GENDER, LOOKING_FOR, CITY, NAME, BIO, PHOTOS = range(7)
@@ -18,6 +19,7 @@ AGE, GENDER, LOOKING_FOR, CITY, NAME, BIO, PHOTOS = range(7)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Your existing handler functions (unchanged except for show_profile)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "Hi! I'm a simple match bot.\n\n"
@@ -109,7 +111,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
-# Swipe
 async def swipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     profile = db.get_profile(user_id)
@@ -127,7 +128,10 @@ async def swipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = context.user_data['index']
     if idx >= len(context.user_data['candidates']):
-        await update.message.reply_text("No more profiles. Use /swipe again.")
+        if hasattr(update, 'callback_query') and update.callback_query:
+            await update.callback_query.message.reply_text("No more profiles. Use /swipe again.")
+        else:
+            await update.message.reply_text("No more profiles. Use /swipe again.")
         return
     cand_id = context.user_data['candidates'][idx]
     cand = db.get_profile(cand_id)
@@ -137,11 +141,19 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("Skip", callback_data=f"skip_{cand_id}")]
     ]
     markup = InlineKeyboardMarkup(keyboard)
+    chat_id = update.effective_chat.id
     if cand['photos']:
         with open(cand['photos'][0], 'rb') as f:
-            await context.bot.send_photo(update.effective_chat.id, f, caption=caption, reply_markup=markup)
+            if hasattr(update, 'callback_query') and update.callback_query:
+                await context.bot.send_photo(chat_id, f, caption=caption, reply_markup=markup)
+            else:
+                await context.bot.send_photo(chat_id, f, caption=caption, reply_markup=markup)
     else:
-        await update.message.reply_text(caption, reply_markup=markup)
+        text_msg = caption if not hasattr(update, 'callback_query') else None
+        if text_msg:
+            await update.message.reply_text(caption, reply_markup=markup)
+        else:
+            await context.bot.send_message(chat_id, caption, reply_markup=markup)
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -174,10 +186,18 @@ async def matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• {m['name']}, {m['age']} ({m['city']})\n"
     await update.message.reply_text(text)
 
-def main():
-    db.init_db()
-    app = Application.builder().token(TOKEN).build()
+# Webhook entry point
+async def webhook_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await application.process_update(update)
 
+def run_bot():
+    global application
+    # Init DB
+    db.init_db()
+    # Build app with webhook
+    request = HTTPXRequest(connect_timeout=10, read_timeout=10)
+    application = Application.builder().token(TOKEN).request(request).build()
+    # Add handlers (same as before)
     conv = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -191,14 +211,29 @@ def main():
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
+    application.add_handler(conv)
+    application.add_handler(CommandHandler('swipe', swipe))
+    application.add_handler(CommandHandler('matches', matches))
+    application.add_handler(CallbackQueryHandler(button))
+    application.add_handler(MessageHandler(filters.ALL, webhook_update))  # Catch-all for webhook
 
-    app.add_handler(conv)
-    app.add_handler(CommandHandler('swipe', swipe))
-    app.add_handler(CommandHandler('matches', matches))
-    app.add_handler(CallbackQueryHandler(button))
-
-    print("Bot starting...")
-    app.run_polling()
+def main():
+    port = int(os.environ.get('PORT', 10000))
+    run_bot()
+    # Set webhook (replace with your Render URL after deployment)
+    webhook_url = f"https://your-app-name.onrender.com/{TOKEN}"  # Update 'your-app-name' post-deploy
+    application.bot.set_webhook(url=webhook_url)
+    # Run as web server
+    from flask import Flask, request
+    app = Flask(__name__)
+    @app.route(f'/{TOKEN}', methods=['POST'])
+    def webhook():
+        if request.headers.get('content-type') == 'application/json':
+            json_string = request.get_json()
+            update = Update.de_json(json_string, application.bot)
+            application.process_update(update)
+        return 'ok'
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 if __name__ == '__main__':
     main()
